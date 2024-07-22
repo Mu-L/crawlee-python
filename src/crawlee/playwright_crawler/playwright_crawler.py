@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Literal
 
+from pydantic import HttpUrl
 from typing_extensions import Unpack
 
 from crawlee._utils.blocked import RETRY_CSS_SELECTORS
@@ -99,13 +100,13 @@ class PlaywrightCrawler(BasicCrawler[PlaywrightCrawlingContext]):
 
         # Create a new browser page, navigate to the URL and get response.
         crawlee_page = await self._browser_pool.new_page(proxy_info=context.proxy_info)
-        response = await crawlee_page.page.goto(context.request.url)
+        response = await crawlee_page.page.goto(str(context.request.url))
 
         if response is None:
             raise SessionError(f'Failed to load the URL: {context.request.url}')
 
         # Set the loaded URL to the actual URL after redirection.
-        context.request.loaded_url = crawlee_page.page.url
+        context.request.loaded_url = HttpUrl(crawlee_page.page.url)
 
         async def enqueue_links(
             *,

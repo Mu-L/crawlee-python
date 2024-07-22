@@ -9,7 +9,6 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
-import httpx
 import pytest
 from httpx import Headers, Response
 
@@ -35,7 +34,7 @@ async def test_processes_requests() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
 
     await crawler.run()
 
@@ -48,7 +47,7 @@ async def test_processes_requests_from_run_args() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
 
     await crawler.run(['http://a.com', 'http://b.com', 'http://c.com'])
 
@@ -61,7 +60,7 @@ async def test_allows_multiple_run_calls() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
 
     await crawler.run(['http://a.com', 'http://b.com', 'http://c.com'])
     await crawler.run(['http://a.com', 'http://b.com', 'http://c.com'])
@@ -82,7 +81,7 @@ async def test_retries_failed_requests() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
 
         if context.request.url == 'http://b.com':
             raise RuntimeError('Arbitrary crash for testing purposes')
@@ -109,7 +108,7 @@ async def test_respects_no_retry() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
         raise RuntimeError('Arbitrary crash for testing purposes')
 
     await crawler.run()
@@ -140,7 +139,7 @@ async def test_respects_request_specific_max_retries() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        calls.append(context.request.url)
+        calls.append(str(context.request.url))
         raise RuntimeError('Arbitrary crash for testing purposes')
 
     await crawler.run()
@@ -435,7 +434,10 @@ async def test_final_statistics() -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        id = int(httpx.URL(context.request.url).params['id'])
+        id_param = context.request.get_query_param_from_url('id')
+        assert id_param is not None
+        id = int(id_param)
+
         await asyncio.sleep(0.001)
 
         if context.request.retry_count == 0 and id % 2 == 0:
@@ -488,7 +490,7 @@ async def test_crawler_run_requests(httpbin: str) -> None:
 
     @crawler.router.default_handler
     async def handler(context: BasicCrawlingContext) -> None:
-        seen_urls.append(context.request.url)
+        seen_urls.append(str(context.request.url))
 
     stats = await crawler.run([f'{httpbin}/1', f'{httpbin}/2', f'{httpbin}/3'])
 
