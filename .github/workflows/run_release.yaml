@@ -38,12 +38,15 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'push' &&
-        !startsWith(github.event.head_commit.message, 'docs') &&
-        !startsWith(github.event.head_commit.message, 'chore')
+        !startsWith(github.event.head_commit.message, 'docs:') &&
+        !startsWith(github.event.head_commit.message, 'chore:') &&
+        !startsWith(github.event.head_commit.message, 'ci:')
       )
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
-      version_number: ${{ steps.version_number.result }}
+      version_number: ${{ steps.version_number.outputs.result }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,15 +58,16 @@ jobs:
           git tag | grep 'b[0-9]' | xargs git tag --delete
 
       - name: Install git-cliff
-        run: cargo install git-cliff
+        run: pip install git-cliff
 
       - name: Determine version number
         id: version_number
         run: |
-          if [[ ${{ github.event_name }} = workflow_dispatch && ${{ github.event.inputs.release_type }} = custom ]]; then
-            echo result=$(echo ${{ github.event.inputs.custom_version }} | sed s/^v//) >> $GITHUB_OUTPUT
+          if [[ '${{ github.event_name }}' = workflow_dispatch && '${{ github.event.inputs.release_type }}' = custom ]]; then
+            echo result=$(echo ${{ github.event.inputs.custom_version }} | sed s/^v//) | tee -a $GITHUB_OUTPUT
           else
-            echo result=$(git-cliff --bumped-version | sed s/^v//)
+            echo result=$(git-cliff --bumped-version | sed s/^v//) | tee -a $GITHUB_OUTPUT
+          fi
 
   update_changelog:
     name: Update changelog
@@ -73,45 +77,52 @@ jobs:
       contents: write
       id-token: write # Required for OIDC authentication.
     outputs:
-      changelog_commitish: ${{ steps.push.commitish }}
+      changelog_commitish: ${{ steps.commit.commit_long_sha || github.sha }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
 
       - name: Locally remove beta tags
         run: |
           git tag | grep 'b[0-9]' | xargs git tag --delete
 
       - name: Install git-cliff
-        run: cargo install git-cliff
-
-      - name: Set up git
-        run: |
-          git config --global user.name "Apify Release Bot"
-          git config --global user.email "noreply@apify.com"
+        run: pip install git-cliff
 
       - name: Generate changelog with git-cliff
         run: |
           if [[ ${{ github.event_name }} = workflow_dispatch ]]; then
-            git-cliff --tag v${{ needs.should_release.outputs.version }} > CHANGELOG.md
+            git-cliff --tag v${{ needs.should_release.outputs.version_number }} > CHANGELOG.md
           else
-            git-cliff --with-tag-message v${{ needs.should_release.outputs.version }} > CHANGELOG.md
+            git-cliff --with-tag-message v${{ needs.should_release.outputs.version_number }} > CHANGELOG.md
           fi
 
-      - name: Commit and push the result
-        id: push
-        run: |
-          git commit -am "chore(release): Update changelog [skip ci]"
-          git push origin master
-          echo commitish=$(git rev-parse HEAD) >> $GITHUB_OUTPUT
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Update package version in pyproject.toml
+        run: poetry version ${{ needs.should_release.outputs.version_number }}
+
+      - name: Commit changes
+        id: commit
+        uses: EndBug/add-and-commit@v9
+        with:
+          author_name: Apify Release Bot
+          author_email: noreply@apify.com
+          message: 'chore(release): Update changelog and package version [skip ci]'
 
   create_github_release:
     name: Create github release
     if: github.event_name == 'workflow_dispatch'
-    needs: [update_changelog]
+    needs: [update_changelog, should_release]
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,23 +134,25 @@ jobs:
           git tag | grep 'b[0-9]' | xargs git tag --delete
 
       - name: Install git-cliff
-        run: cargo install git-cliff
+        run: pip install git-cliff
 
       - name: Generate release notes with git-cliff
-        run: git-cliff --tag "v${{ steps.version_number.outputs.result }}" --unreleased --strip all > release_notes.md
+        run: git-cliff --tag "v${{ needs.should_release.outputs.version_number }}" --unreleased --strip all > release_notes.md
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.should_release.outputs.version }}
-          name: ${{ needs.should_release.outputs.version }}
+          tag_name: v${{ needs.should_release.outputs.version_number }}
+          name: ${{ needs.should_release.outputs.version_number }}
           target_commitish: ${{ needs.update_changelog.outputs.changelog_commitish }}
           body_path: release_notes.md
 
   publish_to_pypi:
     name: Publish to PyPI
-    needs: [create_github_release]
+    needs: [should_release]
     uses: ./.github/workflows/_publish_to_pypi.yaml
+    with:
+      version_number: ${{ needs.should_release.outputs.version_number }}
 
   # TODO: add job for publish package to Conda
   # https://github.com/apify/crawlee-py/issues/104

@@ -25,24 +25,24 @@ from crawlee.autoscaling import AutoscaledPool, ConcurrencySettings
 from crawlee.autoscaling.snapshotter import Snapshotter
 from crawlee.autoscaling.system_status import SystemStatus
 from crawlee.basic_crawler.context_pipeline import ContextPipeline
-from crawlee.basic_crawler.errors import (
+from crawlee.basic_crawler.router import Router
+from crawlee.configuration import Configuration
+from crawlee.enqueue_strategy import EnqueueStrategy
+from crawlee.errors import (
     ContextPipelineInitializationError,
     ContextPipelineInterruptedError,
     RequestHandlerError,
     SessionError,
     UserDefinedErrorHandlerError,
 )
-from crawlee.basic_crawler.router import Router
-from crawlee.basic_crawler.types import BasicCrawlingContext, RequestHandlerRunResult, SendRequestFunction
-from crawlee.configuration import Configuration
-from crawlee.enqueue_strategy import EnqueueStrategy
 from crawlee.events import LocalEventManager
-from crawlee.http_clients import HttpxClient
+from crawlee.http_clients import HttpxHttpClient
 from crawlee.log_config import CrawleeLogFormatter
 from crawlee.models import BaseRequestData, DatasetItemsListPage, Request, RequestState
 from crawlee.sessions import SessionPool
 from crawlee.statistics import Statistics
 from crawlee.storages import Dataset, KeyValueStore, RequestQueue
+from crawlee.types import BasicCrawlingContext, HttpHeaders, RequestHandlerRunResult, SendRequestFunction
 
 if TYPE_CHECKING:
     import re
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from crawlee.statistics import FinalStatistics, StatisticsState
     from crawlee.storages.dataset import GetDataKwargs, PushDataKwargs
     from crawlee.storages.request_provider import RequestProvider
-    from crawlee.types import JSONSerializable
+    from crawlee.types import HttpMethod, JSONSerializable
 
 TCrawlingContext = TypeVar('TCrawlingContext', bound=BasicCrawlingContext, default=BasicCrawlingContext)
 ErrorHandler = Callable[[TCrawlingContext, Exception], Awaitable[Union[Request, None]]]
@@ -152,7 +152,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
             self._router = None
             self.router.default_handler(request_handler)
 
-        self._http_client = http_client or HttpxClient()
+        self._http_client = http_client or HttpxHttpClient()
 
         self._context_pipeline = (_context_pipeline or ContextPipeline()).compose(self._check_url_after_redirects)
 
@@ -215,7 +215,8 @@ class BasicCrawler(Generic[TCrawlingContext]):
         self._proxy_configuration = proxy_configuration
         self._statistics = statistics or Statistics(
             event_manager=self._event_manager,
-            log_message=f'{self._logger.name} request statistics',
+            periodic_message_logger=self._logger,
+            log_message='Current request statistics:',
         )
         self._additional_context_managers = _additional_context_managers or []
 
@@ -288,7 +289,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
     ) -> RequestProvider:
         """Return the configured request provider. If none is configured, open and return the default request queue."""
         if not self._request_provider:
-            self._request_provider = await RequestQueue.open(id=id, name=name)
+            self._request_provider = await RequestQueue.open(id=id, name=name, configuration=self._configuration)
 
         return self._request_provider
 
@@ -299,7 +300,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
         name: str | None = None,
     ) -> Dataset:
         """Return the dataset with the given ID or name. If none is provided, return the default dataset."""
-        return await Dataset.open(id=id, name=name)
+        return await Dataset.open(id=id, name=name, configuration=self._configuration)
 
     async def get_key_value_store(
         self,
@@ -308,7 +309,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
         name: str | None = None,
     ) -> KeyValueStore:
         """Return the key-value store with the given ID or name. If none is provided, return the default KVS."""
-        return await KeyValueStore.open(id=id, name=name)
+        return await KeyValueStore.open(id=id, name=name, configuration=self._configuration)
 
     def error_handler(
         self, handler: ErrorHandler[TCrawlingContext | BasicCrawlingContext]
@@ -324,8 +325,19 @@ class BasicCrawler(Generic[TCrawlingContext]):
         self._failed_request_handler = handler
         return handler
 
-    async def run(self, requests: Sequence[str | BaseRequestData | Request] | None = None) -> FinalStatistics:
-        """Run the crawler until all requests are processed."""
+    async def run(
+        self,
+        requests: Sequence[str | BaseRequestData | Request] | None = None,
+        *,
+        purge_request_queue: bool = True,
+    ) -> FinalStatistics:
+        """Run the crawler until all requests are processed.
+
+        Args:
+            requests: The requests to be enqueued before the crawler starts
+            purge_request_queue: If this is `True` and the crawler is not being run for the first time, the default
+                request queue will be purged
+        """
         if self._running:
             raise RuntimeError(
                 'This crawler instance is already running, you can add more requests to it via `crawler.add_requests()`'
@@ -338,6 +350,11 @@ class BasicCrawler(Generic[TCrawlingContext]):
 
             if self._use_session_pool:
                 await self._session_pool.reset_store()
+
+            request_provider = await self.get_request_provider()
+            if purge_request_queue and isinstance(request_provider, RequestQueue):
+                await request_provider.drop()
+                self._request_provider = await RequestQueue.open(configuration=self._configuration)
 
         if requests is not None:
             await self.add_requests(requests)
@@ -382,7 +399,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
         self._has_finished_before = True
 
         final_statistics = self._statistics.calculate()
-        self._logger.info(f'Final request statistics: {final_statistics}')
+        self._logger.info(f'Final request statistics:\n{final_statistics.to_table()}')
 
         return final_statistics
 
@@ -468,7 +485,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
             dataset_id: The ID of the dataset.
             dataset_name: The name of the dataset.
         """
-        dataset = await Dataset.open(id=dataset_id, name=dataset_name)
+        dataset = await self.get_dataset(id=dataset_id, name=dataset_name)
         path = path if isinstance(path, Path) else Path(path)
 
         if content_type is None:
@@ -494,7 +511,7 @@ class BasicCrawler(Generic[TCrawlingContext]):
             dataset_name: The name of the dataset.
             kwargs: Keyword arguments to be passed to the dataset's `push_data` method.
         """
-        dataset = await Dataset.open(id=dataset_id, name=dataset_name)
+        dataset = await self.get_dataset(id=dataset_id, name=dataset_name)
         await dataset.push_data(data, **kwargs)
 
     def _should_retry_request(self, crawling_context: BasicCrawlingContext, error: Exception) -> bool:
@@ -667,13 +684,13 @@ class BasicCrawler(Generic[TCrawlingContext]):
         async def send_request(
             url: str,
             *,
-            method: str = 'get',
-            headers: dict[str, str] | None = None,
+            method: HttpMethod = 'GET',
+            headers: HttpHeaders | None = None,
         ) -> HttpResponse:
             return await self._http_client.send_request(
-                url,
+                url=url,
                 method=method,
-                headers=headers or {},
+                headers=headers,
                 session=session,
                 proxy_info=proxy_info,
             )
@@ -729,7 +746,6 @@ class BasicCrawler(Generic[TCrawlingContext]):
                 f'All ongoing requests have now completed. Total requests processed: '
                 f'{self._statistics.state.requests_finished}. The crawler will now shut down.'
             )
-            self._logger.info(f'is_finished: {is_finished}')
             return True
 
         return is_finished
